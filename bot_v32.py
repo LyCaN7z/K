@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 # ╔══════════════════════════════════════════════════════════════╗
-# ║     Website Downloader Bot  v30.0  — Perfect Downloader     ║
-# ║  ✅ All V29 features + Download Engine Overhaul             ║
-# ║ ──────────────── v30 Download Fixes ────────────────────── ║
-# ║  🔧 HTML rewriting: href/src → local relative paths         ║
-# ║     (link, script, img, picture/source, video, a, form,    ║
-# ║      inline style, SVG image/use) — offline browsing fixed  ║
-# ║  🔧 CSS @import recursive (3 levels) + CSS url() rewrite   ║
-# ║  🔧 Crawl depth control --depth N (default 5, max 10)      ║
-# ║  🔧 Custom cookie support --cookie "session=abc"            ║
-# ║  🔧 Custom header support --header "Key: Value"             ║
-# ║  🔧 <picture><source srcset> WebP/AVIF extraction           ║
-# ║  🔧 SVG <image href> + <use xlink:href> sprite extraction   ║
-# ║  🔧 JS webpack chunks + Next.js /_next/ extraction          ║
-# ║  🔧 Large file skip (video/exe/iso >50MB auto-skip)         ║
-# ║  🔧 URL normalization (trailing slash dedup fixed)          ║
+# ║     Website Downloader Bot  v33.0  — Scan Fix               ║
+# ║  ✅ All V32 features + Bug Fixes                            ║
+# ║ ──────────────── v33 Fixes ─────────────────────────────── ║
+# ║  🔧 BUG FIX: /analyze + /codeaudit now work after /dl      ║
+# ║     (source dir kept; zip extraction fallback added)        ║
+# ║  🔧 BUG FIX: gofile API - safer server/response parsing    ║
+# ║     (no more silent KeyError crash → link provided)        ║
+# ║  🔧 BUG FIX: /analyze + /codeaudit now set _active_scans   ║
+# ║     (/stop works; concurrent scan protection added)        ║
+# ║  🆕 NEW: /cleandl <domain|all> — admin disk cleanup        ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 import os, re, json, time, shutil, zipfile, hashlib, hmac, string, struct, tempfile, threading
@@ -2590,9 +2585,15 @@ def _upload_gofile(zip_path: str, progress_cb=None) -> str | None:
         srv_resp = _req.get("https://api.gofile.io/servers", headers=headers, timeout=10)
         srv_data = srv_resp.json()
         if srv_data.get("status") != "ok":
-            logger.debug("gofile server list failed: %s", srv_data)
+            logger.warning("gofile server list failed (status=%s): %s",
+                           srv_data.get("status"), str(srv_data)[:200])
             return None
-        server = srv_data["data"]["servers"][0]["name"]
+        # API v2: data.servers[].name  (robust key access)
+        _srv_list = (srv_data.get("data") or {}).get("servers", [])
+        if not _srv_list:
+            logger.warning("gofile: empty server list: %s", str(srv_data)[:200])
+            return None
+        server = _srv_list[0].get("name") or _srv_list[0].get("id", "store1")
         logger.info("gofile.io upload server: %s", server)
 
         if progress_cb:
@@ -2612,17 +2613,23 @@ def _upload_gofile(zip_path: str, progress_cb=None) -> str | None:
                 timeout=600,   # 10min for very large files
             )
         if resp.status_code != 200:
-            logger.debug("gofile upload HTTP %d: %s", resp.status_code, resp.text[:200])
+            logger.warning("gofile upload HTTP %d: %s", resp.status_code, resp.text[:300])
             return None
 
         data = resp.json()
         if data.get("status") != "ok":
-            logger.debug("gofile upload status not ok: %s", data)
+            logger.warning("gofile upload status not ok: %s", str(data)[:300])
             return None
 
-        content_id  = data["data"].get("id", "")
-        dl_page     = data["data"].get("downloadPage", "")
-        direct_link = data["data"].get("directLink", "")
+        _data = data.get("data") or {}
+        content_id  = _data.get("id", "")
+        dl_page     = _data.get("downloadPage", "")
+        direct_link = _data.get("directLink", "")
+        # Fallback: some API versions use 'code' to construct download URL
+        if not dl_page and not direct_link:
+            _code = _data.get("code", "")
+            if _code:
+                dl_page = f"https://gofile.io/d/{_code}"
 
         # Step 3: Set content options via PATCH (token required)
         # — No expiry (permanent for account), public access
@@ -4627,7 +4634,8 @@ def download_website(
                 fp = os.path.join(root,file)
                 zf.write(fp, os.path.relpath(fp, DOWNLOAD_DIR))
 
-    shutil.rmtree(domain_dir, ignore_errors=True)
+    # NOTE: domain_dir is kept intact for /analyze and /codeaudit scanning.
+    # Use /cleandl <domain> (admin) to delete source files manually.
     clear_resume(base_url)
 
     size_mb = os.path.getsize(zip_path)/1024/1024
@@ -12269,7 +12277,22 @@ def _analyze_source_sync(domain: str) -> dict:
         "stats": {"files_scanned": 0, "js_scanned": 0, "html_scanned": 0,
                   "total_secrets": 0, "total_routes": 0, "total_xss": 0, "total_sqli": 0},
     }
-    if not result["found_dir"]:
+    # Zip extraction fallback: domain_dir deleted after /dl but zip still exists
+    _extracted_for_analyze = False
+    if not os.path.exists(domain_dir):
+        _zip = os.path.join(DOWNLOAD_DIR, f"{domain_safe}.zip")
+        if os.path.exists(_zip):
+            try:
+                with zipfile.ZipFile(_zip, 'r') as _zf:
+                    _zf.extractall(DOWNLOAD_DIR)
+                _extracted_for_analyze = True
+                result["found_dir"] = True
+            except Exception as _e:
+                logger.debug("analyze: zip extract failed: %s", _e)
+                return result
+        else:
+            return result
+    elif not result["found_dir"]:
         return result
 
     seen_secrets   = set()
@@ -12391,6 +12414,9 @@ def _analyze_source_sync(domain: str) -> dict:
     result["stats"]["total_sqli"]    = len(result["sqli_sinks"])
     result["routes"]             = sorted(set(result["routes"]))[:100]
     result["hidden_endpoints"]   = sorted(set(result["hidden_endpoints"]))[:100]
+    # Clean up temp-extracted dir (zip fallback case)
+    if _extracted_for_analyze and os.path.exists(domain_dir):
+        shutil.rmtree(domain_dir, ignore_errors=True)
     return result
 
 
@@ -12423,8 +12449,9 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     domain = context.args[0].strip().replace("https://","").replace("http://","").split("/")[0]
     domain_safe = re.sub(r'[^\w\-]', '_', domain)
     domain_dir  = os.path.join(DOWNLOAD_DIR, domain_safe)
+    zip_path    = os.path.join(DOWNLOAD_DIR, f"{domain_safe}.zip")
 
-    if not os.path.exists(domain_dir):
+    if not os.path.exists(domain_dir) and not os.path.exists(zip_path):
         await update.effective_message.reply_text(
             f"❌ *Not found:* `{domain}`\n\n"
             f"ဒီ domain ကို download မဆွဲထားသေးပါ\n"
@@ -12432,6 +12459,15 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
         return
+
+    if uid in _active_scans:
+        await update.effective_message.reply_text(
+            f"⏳ *`{_active_scans[uid]}` running* — `/stop` နှိပ်ပါ",
+            parse_mode='Markdown'
+        )
+        return
+
+    _active_scans[uid] = "Source Analyze"
 
     msg = await update.effective_message.reply_text(
         f"🔬 *Analyzing* `{domain}`...\n\n"
@@ -12445,11 +12481,14 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await asyncio.to_thread(_analyze_source_sync, domain)
     except Exception as e:
+        _active_scans.pop(uid, None)
         await msg.edit_text(
             f"❌ Analyze error: `{type(e).__name__}: {str(e)[:100]}`",
             parse_mode='Markdown'
         )
         return
+    finally:
+        _active_scans.pop(uid, None)
 
     st = result["stats"]
 
@@ -12894,11 +12933,92 @@ async def cmd_apitest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════
-# 📖  /afterdl — Guide command
+# 🗑️  /cleandl — Admin: clean downloaded source dirs
 # ══════════════════════════════════════════════════
 
 @admin_only
-async def cmd_gofileinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_cleandl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cleandl [domain] — Delete source folder(s) to free disk space (admin only)"""
+    if not context.args:
+        # List all downloaded domains
+        try:
+            dirs = [d for d in os.listdir(DOWNLOAD_DIR)
+                    if os.path.isdir(os.path.join(DOWNLOAD_DIR, d))]
+            zips = [f for f in os.listdir(DOWNLOAD_DIR) if f.endswith('.zip')]
+        except Exception:
+            dirs, zips = [], []
+        if not dirs and not zips:
+            await update.effective_message.reply_text(
+                "📂 *Downloaded Sources*\n\nEmpty — nothing to clean.",
+                parse_mode='Markdown'
+            )
+            return
+        total_mb = sum(
+            os.path.getsize(os.path.join(DOWNLOAD_DIR, f))
+            for f in os.listdir(DOWNLOAD_DIR)
+            if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
+        ) / 1024 / 1024
+        lines = ["🗑️ *Downloaded Sources*\n",
+                 f"📂 Folders: `{len(dirs)}`  📦 Zips: `{len(zips)}`  💾 Total: `{total_mb:.1f}MB`\n"]
+        if dirs:
+            lines.append("*Folders (source):*")
+            for d in sorted(dirs)[:20]:
+                sz = sum(
+                    os.path.getsize(os.path.join(r, fn))
+                    for r, _, fs in os.walk(os.path.join(DOWNLOAD_DIR, d))
+                    for fn in fs
+                ) / 1024 / 1024
+                lines.append(f"  `{d}` — {sz:.1f}MB")
+        lines.append("\n_Usage: `/cleandl <domain>` — specific domain_")
+        lines.append("_`/cleandl all` — delete ALL source folders_")
+        await update.effective_message.reply_text(
+            "\n".join(lines), parse_mode='Markdown'
+        )
+        return
+
+    target = context.args[0].strip()
+
+    if target == "all":
+        # Delete all source dirs (keep zips)
+        deleted = []
+        for d in os.listdir(DOWNLOAD_DIR):
+            full = os.path.join(DOWNLOAD_DIR, d)
+            if os.path.isdir(full):
+                shutil.rmtree(full, ignore_errors=True)
+                deleted.append(d)
+        await update.effective_message.reply_text(
+            f"🗑️ Deleted `{len(deleted)}` source folders.",
+            parse_mode='Markdown'
+        )
+        return
+
+    # Delete specific domain
+    domain = target.replace("https://", "").replace("http://", "").split("/")[0]
+    domain_safe = re.sub(r'[^\w\-]', '_', domain)
+    domain_dir  = os.path.join(DOWNLOAD_DIR, domain_safe)
+    zip_path    = os.path.join(DOWNLOAD_DIR, f"{domain_safe}.zip")
+
+    deleted = []
+    if os.path.exists(domain_dir):
+        shutil.rmtree(domain_dir, ignore_errors=True)
+        deleted.append(f"📂 `{domain_safe}/`")
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+        deleted.append(f"📦 `{domain_safe}.zip`")
+
+    if deleted:
+        await update.effective_message.reply_text(
+            f"🗑️ Deleted: {', '.join(deleted)}",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"❌ `{domain}` — not found in downloads",
+            parse_mode='Markdown'
+        )
+
+
+
     """/gofileinfo — Check gofile.io account status and storage usage"""
     msg = await update.effective_message.reply_text(
         "🔍 gofile.io account info ရှာနေပါတယ်...", parse_mode='Markdown'
@@ -13105,7 +13225,22 @@ def _codeaudit_sync(domain: str) -> dict:
         },
     }
 
-    if not result["found_dir"]:
+    # Zip extraction fallback: domain_dir deleted after /dl but zip still exists
+    _extracted_for_codeaudit = False
+    if not os.path.exists(domain_dir):
+        _zip = os.path.join(DOWNLOAD_DIR, f"{domain_safe}.zip")
+        if os.path.exists(_zip):
+            try:
+                with zipfile.ZipFile(_zip, 'r') as _zf:
+                    _zf.extractall(DOWNLOAD_DIR)
+                _extracted_for_codeaudit = True
+                result["found_dir"] = True
+            except Exception as _e:
+                logger.debug("codeaudit: zip extract failed: %s", _e)
+                return result
+        else:
+            return result
+    elif not result["found_dir"]:
         return result
 
     seen = set()
@@ -13193,6 +13328,9 @@ def _codeaudit_sync(domain: str) -> dict:
              len(result["xss"]) + len(result["upload"]) + len(result["creds"]))
     result["stats"]["total_issues"] = total
     result["admin_paths"] = sorted(set(result["admin_paths"]))[:50]
+    # Clean up temp-extracted dir (zip fallback case)
+    if _extracted_for_codeaudit and os.path.exists(domain_dir):
+        shutil.rmtree(domain_dir, ignore_errors=True)
     return result
 
 
@@ -13229,14 +13367,24 @@ async def cmd_codeaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
               .replace("https://", "").replace("http://", "").split("/")[0])
     domain_safe = re.sub(r'[^\w\-]', '_', domain)
     domain_dir  = os.path.join(DOWNLOAD_DIR, domain_safe)
+    zip_path    = os.path.join(DOWNLOAD_DIR, f"{domain_safe}.zip")
 
-    if not os.path.exists(domain_dir):
+    if not os.path.exists(domain_dir) and not os.path.exists(zip_path):
         await update.effective_message.reply_text(
             f"❌ `{domain}` ကို download မဆွဲထားသေးပါ\n"
             f"ဦးဆုံး `/dl https://{domain}` သုံးပါ",
             parse_mode='Markdown'
         )
         return
+
+    if uid in _active_scans:
+        await update.effective_message.reply_text(
+            f"⏳ *`{_active_scans[uid]}` running* — `/stop` နှိပ်ပါ",
+            parse_mode='Markdown'
+        )
+        return
+
+    _active_scans[uid] = "Code Audit"
 
     msg = await update.effective_message.reply_text(
         f"🔍 *Code Audit — `{domain}`*\n\n"
@@ -13250,11 +13398,14 @@ async def cmd_codeaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await asyncio.to_thread(_codeaudit_sync, domain)
     except Exception as e:
+        _active_scans.pop(uid, None)
         await msg.edit_text(
             f"❌ Audit error: `{type(e).__name__}: {str(e)[:100]}`",
             parse_mode='Markdown'
         )
         return
+    finally:
+        _active_scans.pop(uid, None)
 
     st = result["stats"]
     sev_icon = {"🔴": 0, "🟠": 0, "🟡": 0}
@@ -13477,6 +13628,7 @@ def main():
     app.add_handler(CommandHandler("afterdl",   cmd_afterdl))    # guide command
     app.add_handler(CommandHandler("codeaudit",  cmd_codeaudit))   # backend code audit (PHP/Python)
     app.add_handler(CommandHandler("gofileinfo", cmd_gofileinfo))  # gofile.io account status (admin)
+    app.add_handler(CommandHandler("cleandl",   cmd_cleandl))     # clean downloaded sources (admin)
 
     # ── Callbacks ─────────────────────────────────
     app.add_handler(CallbackQueryHandler(force_join_callback,    pattern="^fj_check$"))
@@ -13581,6 +13733,7 @@ def main():
             BotCommand("sys",         "🖥️ System logs/disk"),
             BotCommand("adminset",    "⚙️ Bot settings"),
             BotCommand("gofileinfo",  "☁️ gofile.io account status"),
+            BotCommand("cleandl",     "🗑️ Delete downloaded source folders (admin)"),
         ]
 
         try:
