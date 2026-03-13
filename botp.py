@@ -23,6 +23,8 @@ from urllib.parse import urljoin, urlparse
 from functools import lru_cache
 import sqlite3                                   # SQLite — built-in, no extra install
 import requests
+import aiohttp
+import aiofiles
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import urllib3
@@ -18674,8 +18676,6 @@ async def cmd_ssltls(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #    ✅ Download progress + speed display
 # ══════════════════════════════════════════════════
 
-import aiohttp
-import aiofiles
 
 _PROXY_SOURCES = [
     # HTTP proxies

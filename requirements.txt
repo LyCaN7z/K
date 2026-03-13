@@ -1,22 +1,10 @@
-# ── requirements.txt — ai_bot.py v31.0 (Railway $20 Pro) ──
-# pip install -r requirements.txt
-# playwright install chromium   ← မဖြစ်မနေ သီးခြား run ရမည်
-
-# HTTP requests & retry
-requests==2.32.3
-urllib3==2.2.3
-
-# HTML parsing
-beautifulsoup4==4.12.3
-
-# Telegram Bot framework
-python-telegram-bot==21.6
-
-# OpenAI API (AI Orchestrator)
-openai==1.51.0
-
-# Playwright — Python 3.13 compatible (greenlet 3.1.1+)
-playwright==1.49.1
-
-# Environment variables
-python-dotenv==1.0.1
+python-telegram-bot[webhooks,socks]==20.7
+requests[socks]
+aiohttp
+aiofiles
+httpx
+urllib3
+beautifulsoup4
+lxml
+psutil
+aiohttp-socks
